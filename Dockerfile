@@ -1,3 +1,15 @@
+FROM python:3.11-slim-bookworm AS builder
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python -m pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
 FROM python:3.11-slim-bookworm
 
 WORKDIR /app
@@ -10,8 +22,10 @@ ENV PYTHONUNBUFFERED=1 \
     UC_CONFIG_HOME=/config
 
 COPY requirements.txt ./
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -r requirements.txt \
+COPY --from=builder /wheels /wheels
+RUN python -m pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && python -c "import miniaudio, pyatv, ucapi, ucapi_framework" \
+    && rm -rf /wheels \
     && mkdir -p /config
 
 COPY driver.json LICENSE ./
