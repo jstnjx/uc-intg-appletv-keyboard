@@ -1,4 +1,4 @@
-"""Apple TV Companion connection and keyboard handling."""
+"""Apple TV Companion device implemented with ucapi-framework."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from typing import Any
 import pyatv
 from pyatv.const import KeyboardFocusState, Protocol
 from pyatv.interface import AppleTV, DeviceListener, KeyboardListener
+from ucapi_framework import ExternalClientDevice
 
 from config import AppleTVConfig
 
@@ -16,138 +17,185 @@ _LOG = logging.getLogger(__name__)
 
 
 class _DeviceListener(DeviceListener):
-    def __init__(self, client: "AppleTVKeyboardClient") -> None:
-        self._client = client
+    def __init__(self, device: "AppleTVKeyboardDevice") -> None:
+        self._device = device
 
     def connection_lost(self, exception: Exception) -> None:
-        _LOG.warning("Apple TV connection lost: %s", exception)
-        self._client.mark_disconnected()
+        _LOG.warning("[%s] Apple TV connection lost: %s", self._device.log_id, exception)
+        self._device.on_client_disconnected()
 
     def connection_closed(self) -> None:
-        _LOG.debug("Apple TV connection closed")
-        self._client.mark_disconnected()
+        _LOG.debug("[%s] Apple TV connection closed", self._device.log_id)
+        self._device.on_client_disconnected()
 
 
 class _KeyboardListener(KeyboardListener):
-    def __init__(self, client: "AppleTVKeyboardClient") -> None:
-        self._client = client
+    def __init__(self, device: "AppleTVKeyboardDevice") -> None:
+        self._device = device
 
     def focusstate_update(
         self,
         old_state: KeyboardFocusState,
         new_state: KeyboardFocusState,
     ) -> None:
-        _LOG.debug("Apple TV keyboard focus: %s -> %s", old_state, new_state)
-        self._client.focus_state = new_state
+        _LOG.debug(
+            "[%s] Apple TV keyboard focus: %s -> %s",
+            self._device.log_id,
+            old_state,
+            new_state,
+        )
+        self._device.focus_state = new_state
+        self._device.push_update()
 
 
-class AppleTVKeyboardClient:
-    """Maintains one pyatv Companion connection."""
+class AppleTVKeyboardDevice(ExternalClientDevice):
+    """Framework-managed pyatv Companion connection."""
 
-    def __init__(self, config: AppleTVConfig, loop: asyncio.AbstractEventLoop) -> None:
-        self.config = config
-        self.loop = loop
-        self.atv: AppleTV | None = None
+    def __init__(
+        self,
+        device_config: AppleTVConfig,
+        loop: asyncio.AbstractEventLoop | None = None,
+        config_manager: Any | None = None,
+        driver: Any | None = None,
+    ) -> None:
+        super().__init__(
+            device_config,
+            loop,
+            enable_watchdog=True,
+            watchdog_interval=10,
+            reconnect_delay=2,
+            max_reconnect_attempts=0,
+            config_manager=config_manager,
+            driver=driver,
+        )
         self.focus_state = KeyboardFocusState.Unknown
-        self._connect_lock = asyncio.Lock()
+        self._pyatv_connected = False
         self._device_listener = _DeviceListener(self)
         self._keyboard_listener = _KeyboardListener(self)
 
     @property
-    def connected(self) -> bool:
-        return self.atv is not None
+    def config(self) -> AppleTVConfig:
+        return self._device_config
 
-    def mark_disconnected(self) -> None:
-        self.atv = None
+    @property
+    def identifier(self) -> str:
+        return self.config.identifier
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+    @property
+    def address(self) -> str:
+        return self.config.address
+
+    @property
+    def log_id(self) -> str:
+        return f"AppleTVKeyboard[{self.name}]"
+
+    async def create_client(self) -> AppleTV:
+        """Resolve the configured device and create a Companion-only pyatv client."""
+        hosts = [self.address] if self.address else None
+        devices = await pyatv.scan(
+            self._loop,
+            identifier=self.identifier,
+            hosts=hosts,
+            timeout=5,
+            protocol=Protocol.Companion,
+        )
+        if not devices and hosts:
+            devices = await pyatv.scan(
+                self._loop,
+                identifier=self.identifier,
+                timeout=5,
+                protocol=Protocol.Companion,
+            )
+        if not devices:
+            raise ConnectionError(f"Apple TV {self.identifier} was not found")
+
+        config = devices[0]
+        if config.get_service(Protocol.Companion) is None:
+            raise ConnectionError("Apple TV does not expose the Companion protocol")
+        if not config.set_credentials(
+            Protocol.Companion, self.config.companion_credentials
+        ):
+            raise ConnectionError("Could not apply Apple TV Companion credentials")
+
+        client = await pyatv.connect(
+            config,
+            self._loop,
+            protocol=Protocol.Companion,
+        )
+
+        new_address = str(config.address)
+        if new_address and new_address != self.config.address:
+            self.update_config(address=new_address)
+
+        return client
+
+    async def connect_client(self) -> None:
+        """Attach pyatv listeners after the framework creates the client."""
+        if self._client is None:
+            raise ConnectionError("pyatv client was not created")
+
+        self._client.listener = self._device_listener
+        self._client.keyboard.listener = self._keyboard_listener
+        self._pyatv_connected = True
+        self.focus_state = self._client.keyboard.text_focus_state
+        self._state = "READY"
+        self.push_update()
+
+    async def disconnect_client(self) -> None:
+        """Close the pyatv client."""
+        client = self._client
+        self._pyatv_connected = False
         self.focus_state = KeyboardFocusState.Unknown
+        self._state = "UNAVAILABLE"
+        self.push_update()
 
-    async def connect(self) -> bool:
-        """Connect to the configured Apple TV, resolving it by ID first."""
-        if self.atv is not None:
-            return True
-
-        async with self._connect_lock:
-            if self.atv is not None:
-                return True
-
-            hosts = [self.config.address] if self.config.address else None
-            try:
-                devices = await pyatv.scan(
-                    self.loop,
-                    identifier=self.config.identifier,
-                    hosts=hosts,
-                    timeout=5,
-                )
-                if not devices and hosts:
-                    # DHCP address may have changed. Fall back to mDNS/identifier discovery.
-                    devices = await pyatv.scan(
-                        self.loop,
-                        identifier=self.config.identifier,
-                        timeout=5,
-                    )
-                if not devices:
-                    _LOG.warning("Configured Apple TV not found: %s", self.config.identifier)
-                    return False
-
-                device = devices[0]
-                if not device.set_credentials(
-                    Protocol.Companion, self.config.companion_credentials
-                ):
-                    _LOG.error("Apple TV does not expose the Companion protocol")
-                    return False
-
-                atv = await pyatv.connect(device, self.loop)
-                atv.listener = self._device_listener
-                atv.keyboard.listener = self._keyboard_listener
-                self.atv = atv
-                self.focus_state = atv.keyboard.text_focus_state
-                self.config.address = str(device.address)
-                _LOG.info(
-                    "Connected to Apple TV %s (%s), keyboard focus=%s",
-                    self.config.name,
-                    device.address,
-                    self.focus_state.name,
-                )
-                return True
-            except Exception:  # pyatv exposes several transport/auth exceptions
-                _LOG.exception("Failed to connect to Apple TV")
-                self.mark_disconnected()
-                return False
-
-    async def disconnect(self) -> None:
-        atv = self.atv
-        self.mark_disconnected()
-        if atv is None:
+        if client is None:
             return
-        try:
-            pending = atv.close()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-        except Exception:
-            _LOG.debug("Error while closing Apple TV connection", exc_info=True)
+
+        pending = client.close()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def check_client_connected(self) -> bool:
+        """Return the connection state tracked by pyatv callbacks."""
+        return self._client is not None and self._pyatv_connected
+
+    def on_client_disconnected(self) -> None:
+        """Handle connection loss reported by pyatv."""
+        self._pyatv_connected = False
+        self.focus_state = KeyboardFocusState.Unknown
+        self._state = "UNAVAILABLE"
+        self.push_update()
 
     async def current_focus(self) -> KeyboardFocusState:
-        """Return the latest keyboard focus state after ensuring a connection."""
-        if not await self.connect() or self.atv is None:
+        """Return current tvOS keyboard focus, reconnecting when necessary."""
+        if not self.is_connected:
+            connected = await self.connect()
+            if not connected or self._client is None:
+                return KeyboardFocusState.Unknown
+
+        try:
+            self.focus_state = self._client.keyboard.text_focus_state
+        except Exception:
+            _LOG.debug("[%s] Could not read keyboard focus", self.log_id, exc_info=True)
             return KeyboardFocusState.Unknown
-        # Read the property every time instead of relying only on callbacks. This is
-        # deliberately redundant because keyboard focus push updates have had tvOS/
-        # pyatv edge cases in the past.
-        self.focus_state = self.atv.keyboard.text_focus_state
         return self.focus_state
 
     async def set_text(self, text: str) -> tuple[bool, str]:
-        """Replace the active Apple TV text field with *text*."""
-        if not await self.connect() or self.atv is None:
-            return False, "Apple TV is unavailable"
-
+        """Replace the focused tvOS text field with the supplied text."""
         focus = await self.current_focus()
+        if not self.is_connected or self._client is None:
+            return False, "Apple TV is unavailable"
         if focus != KeyboardFocusState.Focused:
             return False, "Apple TV keyboard is not focused"
 
         try:
-            await self.atv.keyboard.text_set(text)
+            await self._client.keyboard.text_set(text)
             return True, "Text sent to Apple TV"
         except Exception:
-            _LOG.exception("Failed to send Apple TV keyboard text")
+            _LOG.exception("[%s] Failed to send Apple TV keyboard text", self.log_id)
             return False, "Could not send text to Apple TV"

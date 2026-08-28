@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unfolded Circle Apple TV Keyboard integration."""
+"""Unfolded Circle Apple TV Keyboard integration using ucapi-framework."""
 
 from __future__ import annotations
 
@@ -7,95 +7,47 @@ import asyncio
 import logging
 import os
 
-import ucapi
-import ucapi.api as uc
+from ucapi_framework import BaseConfigManager, BaseIntegrationDriver, get_config_path
 
-from apple_tv import AppleTVKeyboardClient
-from config import AppleTVConfig, ConfigStore
+from apple_tv import AppleTVKeyboardDevice
+from config import AppleTVConfig
+from discovery import AppleTVDiscovery
 from media_player import AppleTVKeyboardMediaPlayer
-from setup_flow import SetupFlow
+from setup_flow import AppleTVSetupFlow
 
 _LOG = logging.getLogger("driver")
-_LOOP = asyncio.new_event_loop()
-asyncio.set_event_loop(_LOOP)
-api = uc.IntegrationAPI(_LOOP)
-store = ConfigStore(api.config_dir_path)
-client: AppleTVKeyboardClient | None = None
-entity: AppleTVKeyboardMediaPlayer | None = None
-setup_flow: SetupFlow | None = None
-
-
-def _install_config(config: AppleTVConfig) -> None:
-    """Replace the active client/entity after setup succeeds."""
-    global client, entity
-
-    old_client = client
-    client = AppleTVKeyboardClient(config, _LOOP)
-    entity = AppleTVKeyboardMediaPlayer(client)
-
-    api.available_entities.clear()
-    api.available_entities.add(entity)
-
-    if old_client is not None:
-        _LOOP.create_task(old_client.disconnect())
-
-
-@api.listens_to(ucapi.Events.CONNECT)
-async def on_connect() -> None:
-    await api.set_device_state(ucapi.DeviceStates.CONNECTING)
-    if client is None:
-        await api.set_device_state(ucapi.DeviceStates.DISCONNECTED)
-        return
-    connected = await client.connect()
-    await api.set_device_state(
-        ucapi.DeviceStates.CONNECTED if connected else ucapi.DeviceStates.ERROR
-    )
-
-
-@api.listens_to(ucapi.Events.DISCONNECT)
-async def on_disconnect() -> None:
-    if client is not None:
-        await client.disconnect()
-    await api.set_device_state(ucapi.DeviceStates.DISCONNECTED)
-
-
-@api.listens_to(ucapi.Events.ENTER_STANDBY)
-async def on_standby() -> None:
-    if client is not None:
-        await client.disconnect()
-
-
-@api.listens_to(ucapi.Events.EXIT_STANDBY)
-async def on_wake() -> None:
-    if client is not None:
-        await client.connect()
-
-
-@api.listens_to(ucapi.Events.SUBSCRIBE_ENTITIES)
-async def on_subscribe(entity_ids: list[str]) -> None:
-    if client is not None and "appletv_keyboard" in entity_ids:
-        await client.connect()
 
 
 async def main() -> None:
-    global setup_flow
-
+    """Start the integration driver."""
     logging.basicConfig(
         level=os.getenv("UC_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
     )
 
-    configured = store.load()
-    if configured is not None:
-        _install_config(configured)
+    driver = BaseIntegrationDriver(
+        device_class=AppleTVKeyboardDevice,
+        entity_classes=[AppleTVKeyboardMediaPlayer],
+        driver_id="appletv_keyboard",
+    )
+    driver.config_manager = BaseConfigManager(
+        get_config_path(driver.api.config_dir_path),
+        driver.on_device_added,
+        driver.on_device_removed,
+        config_class=AppleTVConfig,
+    )
 
-    setup_flow = SetupFlow(store, _LOOP, _install_config)
-    await api.init("driver.json", setup_flow)
-    # ucapi 0.7.0 still requires this runtime insertion for dynamic setup metadata.
-    api._driver_info["setup_data_schema"] = setup_flow.setup_data_schema()  # noqa: SLF001
-    await api.set_device_state(ucapi.DeviceStates.DISCONNECTED)
+    await driver.register_all_device_instances()
+
+    discovery = AppleTVDiscovery(timeout=5)
+    setup_handler = AppleTVSetupFlow.create_handler(
+        driver,
+        discovery=discovery,
+    )
+    await driver.api.init("driver.json", setup_handler)
+
+    await asyncio.Future()
 
 
 if __name__ == "__main__":
-    _LOOP.run_until_complete(main())
-    _LOOP.run_forever()
+    asyncio.run(main())

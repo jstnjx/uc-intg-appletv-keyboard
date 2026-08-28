@@ -7,12 +7,13 @@ cd "$ROOT"
 rm -rf build dist
 
 docker run --rm --name uc-appletv-keyboard-builder \
+  --platform=linux/arm64/v8 \
   --user="$(id -u):$(id -g)" \
   -v "$ROOT:/workspace" \
-  docker.io/unfoldedcircle/r2-pyinstaller:3.11.13 \
+  docker.io/unfoldedcircle/r2-pyinstaller:3.11.13-0.7.0 \
   bash -lc 'cd /workspace && \
     python -m pip install -r requirements.txt && \
     pyinstaller --clean --onedir --name intg-appletv-keyboard \
-      intg-appletv-keyboard/driver.py'
+      --collect-all zeroconf intg-appletv-keyboard/driver.py'
 
 echo "Built: dist/intg-appletv-keyboard/"
