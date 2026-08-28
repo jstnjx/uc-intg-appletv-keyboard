@@ -173,6 +173,8 @@ class AppleTVSetupFlow(BaseSetupFlow[AppleTVConfig]):
         if selected is None:
             raise ConnectionError("Apple TV disappeared before pairing")
 
+        self._selected_device = selected
+
         try:
             self._pairing = await pyatv.pair(
                 selected,
@@ -225,6 +227,21 @@ class AppleTVSetupFlow(BaseSetupFlow[AppleTVConfig]):
             credentials = self._pairing.service.credentials
             if not self._pairing.has_paired or not credentials:
                 raise RuntimeError("Pairing did not return Companion credentials")
+
+            # BaseSetupFlow auto-populates matching config fields from every
+            # UserDataResponse before this handler runs. Some external Remote
+            # setup clients repeat the empty optional `name` value together
+            # with the PIN, which overwrites the discovered device name. Make
+            # sure the persisted config always has a usable device name.
+            if not str(self._pending_device_config.name).strip():
+                discovered_name = (
+                    self._selected_device.name
+                    if self._selected_device is not None
+                    else None
+                )
+                self._pending_device_config.name = (
+                    str(discovered_name).strip() if discovered_name else "Apple TV"
+                ) or "Apple TV"
 
             self._pending_device_config.companion_credentials = str(credentials)
             _LOG.info(
