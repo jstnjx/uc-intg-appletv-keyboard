@@ -1,0 +1,20 @@
+{
+  "driver_id": "appletv_keyboard",
+  "version": "0.1.0",
+  "min_core_api": "0.7.1",
+  "name": {
+    "en": "Apple TV Keyboard"
+  },
+  "icon": "uc:integration",
+  "description": {
+    "en": "Use the Remote Two/3 media browser search field as a keyboard for a paired Apple TV."
+  },
+  "developer": {
+    "name": "Community integration"
+  },
+  "home_page": "https://github.com/",
+  "release_date": "2026-08-27",
+  "setup_data_schema": {
+    "_comment": "set at runtime"
+  }
+}
