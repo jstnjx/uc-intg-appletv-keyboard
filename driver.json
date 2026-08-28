@@ -1,6 +1,6 @@
 {
   "driver_id": "appletv_keyboard",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "min_core_api": "0.7.1",
   "name": {
     "en": "Apple TV Keyboard"
